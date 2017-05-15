@@ -11,6 +11,8 @@ import com.badlogic.gdx.graphics.g3d.loader.ObjLoader
 import com.badlogic.gdx.utils.*
 import com.badlogic.gdx.utils.async.AsyncExecutor
 import ktx.async.KtxAsync
+import java.util.ArrayList
+import kotlin.coroutines.experimental.suspendCoroutine
 import com.badlogic.gdx.graphics.g3d.particles.ParticleEffect as ParticleEffect3D
 import com.badlogic.gdx.graphics.g3d.particles.ParticleEffectLoader as ParticleEffect3dLoader
 import com.badlogic.gdx.utils.Array as GdxArray
@@ -29,9 +31,14 @@ class AssetStorage(
     val executor: AsyncExecutor = KtxAsync.asyncExecutor,
     useDefaultLoaders: Boolean = true
 ) : Disposable {
+  /** Used by [loadJson] to deserialize loaded JSON files into objects. */
+  val jsonLoader = Json()
   @Suppress("LeakingThis")
   private val asAssetManager: AssetManager = AssetManagerWrapper(this)
   private val loaderStorage = AssetLoaderStorage()
+  private val dependencies = ObjectMap<String, List<String>>()
+  private val referenceCounts = ObjectIntMap<String>()
+  private val scheduledAssets = ObjectMap<String, MutableList<() -> Unit>>()
 
   /** Internal assets storage. Exposed for inlined methods. Should be accessed only from the rendering thread. Do not
    * modify manually.
@@ -68,27 +75,38 @@ class AssetStorage(
    * @param parameters optional loading parameters passed to the appropriate [AssetLoader] instance.
    * @return fully loaded instance of [Asset].
    * @throws AssetStorageException if unable to load the asset.
+   * @see loadJson
    */
   inline suspend fun <reified Asset : Any> load(path: String, parameters: AssetLoaderParameters<Asset>? = null): Asset
       = load(getAssetDescriptor(path, parameters))
 
   /**
    * @param assetDescriptor stores data of the asset scheduled for loading.
+   * @param isDependency if true, reference count will not be incremented for this asset, which will cause it to be
+   *    unloaded along with other assets that depend on it. Each explicit loading of an asset with this parameter set
+   *    to `false` raises asset's references count by 1 - it will not be unloaded, unless [unload] is explicitly called
+   *    on its path as many times as [load]. Defaults to false and generally should not be changed, unless you want to
+   *    manually preload dependencies of some assets.
    * @return fully loaded instance of [Asset].
    * @throws AssetStorageException if unable to load the asset.
    */
-  suspend fun <Asset : Any> load(assetDescriptor: AssetDescriptor<Asset>): Asset {
+  suspend fun <Asset : Any> load(
+      assetDescriptor: AssetDescriptor<Asset>,
+      isDependency: Boolean = false): Asset {
     val path = assetDescriptor.fileName
+    if (!isDependency) referenceCounts.getAndIncrement(path, 0, 1)
     assets[path]?.apply {
       @Suppress("UNCHECKED_CAST")
       return this as Asset
     }
-    resolveFile(assetDescriptor)
-    val loader = getLoader(assetDescriptor.type, path)
-        ?: throw AssetStorageException("No loader available for assets of type: ${assetDescriptor.type} for file: $path.")
-    loader.getDependencies(assetDescriptor)?.forEach {
-      if (!isLoaded(it.fileName)) load(it)
+    scheduledAssets[path]?.let {
+      return waitForAsset(path, it)
     }
+    resolveFile(assetDescriptor)
+    val loader = getLoader(assetDescriptor.type, path) ?: throwNoLoaderException(assetDescriptor)
+    val loadingCallbacks = mutableListOf<() -> Unit>()
+    scheduledAssets.put(path, loadingCallbacks)
+    loader.getDependencies(assetDescriptor)?.let { handleAssetDependencies(path, it) }
     currentlyLoadedAsset = path
     val asset = try {
       when (loader) {
@@ -102,7 +120,43 @@ class AssetStorage(
     }
     add(path, asset)
     currentlyLoadedAsset = null
+    scheduledAssets.remove(path) ?: throwAsynchronousUnloadingException(path)
+    if (loadingCallbacks.isNotEmpty()) {
+      loadingCallbacks.forEach { it() }
+    }
     return asset
+  }
+
+  private suspend fun <Asset> waitForAsset(
+      path: String,
+      loadingCallbacks: MutableList<() -> Unit>): Asset = suspendCoroutine {
+    loadingCallbacks.add {
+      @Suppress("UNCHECKED_CAST")
+      val asset = assets[path] as Asset? ?: throwAsynchronousUnloadingException(path)
+      it.resume(asset)
+    }
+  }
+
+  private fun throwNoLoaderException(asset: AssetDescriptor<*>): Nothing =
+      throw AssetStorageException("No loader available for assets of type: ${asset.type} for file: ${asset.fileName}.")
+
+  private fun throwAsynchronousUnloadingException(path: String): Nothing =
+      throw AssetStorageException("$path asset was scheduled for loading and got prematurely unloaded asynchronously." +
+          " Avoid manual unloading of asset dependencies.")
+
+  private suspend fun handleAssetDependencies(
+      assetPath: String,
+      assetDependencies: GdxArray<AssetDescriptor<*>>) {
+    val dependencyPaths = ArrayList<String>(assetDependencies.size)
+    dependencies.put(assetPath, dependencyPaths)
+    assetDependencies.forEach {
+      val dependencyPath = it.fileName
+      referenceCounts.getAndIncrement(dependencyPath, 0, 1)
+      dependencyPaths.add(dependencyPath)
+      if (!isLoaded(dependencyPath)) {
+        load(it, isDependency = true)
+      }
+    }
   }
 
   private fun resolveFile(assetDescriptor: AssetDescriptor<*>): FileHandle {
@@ -128,6 +182,67 @@ class AssetStorage(
       descriptor: AssetDescriptor<Asset>): Asset {
     KtxAsync.asynchronous(executor) { asynchronousLoader.loadAsync(asAssetManager, descriptor) }
     return asynchronousLoader.loadSync(asAssetManager, descriptor)
+  }
+
+  /**
+   * A dedicated method for asynchronous loading of JSON assets. Since loaders are tied to a specific type, JSON loader
+   * could not have been implemented using standard [AssetLoader] mechanism without sacrificing its flexibility. Note
+   * that if the JSON represents a collection of values or objects of known type, [loadJsonCollection] should be used
+   * instead.
+   * @param Asset type of object after deserialization.
+   * @param path path to the JSON asset consistent with the [fileResolver] file type.
+   * @return a fully loaded [Asset] representing deserialized JSON.
+   * @see loadJsonCollection
+   * @see jsonLoader
+   */
+  inline suspend fun <reified Asset : Any> loadJson(path: String): Asset = loadJson(path, Asset::class.java)
+
+  /**
+   * A dedicated method for asynchronous loading of JSON assets. Since loaders are tied to a specific type, JSON loader
+   * could not have been implemented using standard [AssetLoader] mechanism without sacrificing its flexibility. Note
+   * that if the JSON does not represent a collection of values or objects, or element types are unknown prior to
+   * deserialization, [loadJson] should be used instead.
+   * @param Asset type of collection after deserialization.
+   * @param Element type of collection elements after deserialization.
+   * @param path path to the JSON asset consistent with the [fileResolver] file type.
+   * @return a fully loaded [Asset] representing deserialized JSON.
+   * @see loadJson
+   * @see jsonLoader
+   */
+  inline suspend fun <reified Asset : Any, reified Element : Any> loadJsonCollection(path: String): Asset =
+      loadJson(path, Asset::class.java, Element::class.java)
+
+  /**
+   * Internal JSON loading method exposed for inlined methods. See [loadJson] and [loadJsonCollection].
+   * @param path to the JSON asset consistent with the [fileResolver] file type.
+   * @param type type of object or collection after deserialization.
+   * @param elementType type of objects stored in the collections. Optional. Relevant only if the JSON file represents
+   *    a collection of values of known type.
+   * @return a fully loaded [Asset] representing deserialized JSON.
+   */
+  suspend fun <Asset : Any> loadJson(path: String, type: Class<Asset>, elementType: Class<*>? = null): Asset {
+    val normalizedPath = path.normalizePath()
+    referenceCounts.getAndIncrement(normalizedPath, 0, 1)
+    assets[normalizedPath]?.apply {
+      @Suppress("UNCHECKED_CAST")
+      return this as Asset
+    }
+    scheduledAssets[path]?.let {
+      return waitForAsset(path, it)
+    }
+    val loadingCallbacks = mutableListOf<() -> Unit>()
+    scheduledAssets.put(path, loadingCallbacks)
+    currentlyLoadedAsset = normalizedPath
+    val asset = KtxAsync.asynchronous(executor) {
+      jsonLoader.fromJson(type, elementType, fileResolver.resolve(normalizedPath))
+    }
+    add(path, asset)
+    currentlyLoadedAsset = null
+    scheduledAssets.remove(path) ?: throwAsynchronousUnloadingException(path)
+    if (loadingCallbacks.isNotEmpty()) {
+      loadingCallbacks.forEach { it() }
+    }
+    return asset
   }
 
   /**
@@ -191,23 +306,32 @@ class AssetStorage(
   }
 
   /**
-   * Removes asset loaded with the given path. Does nothing if asset was not loaded in the first place. Asset will be
-   * disposed if it implements [Disposable].
+   * Removes asset loaded with the given path and all of its dependencies. Does nothing if asset was not loaded in the
+   * first place. Will not dispose of the asset if it still is referenced by any other assets. Asset will be disposed
+   * if it implements [Disposable]. Note: only assets that were explicitly scheduled for loading with [load] should be
+   * unloaded. Assets scheduled for loading multiple times must be explicitly unloaded multiple times - until the asset
+   * is unloaded as many times as it was reference, it is assumed that it is still used. Manually unloading dependencies
+   * of other assets (that were not scheduled for loading explicitly) might lead to unexpected runtime exceptions. This
+   * method should be called only on the main rendering thread.
    * @param path used to [load] the asset.
+   * @throws Exception when unable to dispose of the asset or any of its dependencies.
    */
   fun unload(path: String) {
-    (assets.remove(path.normalizePath()) as? Disposable)?.dispose()
+    val assetsToUnload = Queue<String>()
+    assetsToUnload.addLast(path)
+    while (assetsToUnload.size > 0) {
+      val assetPath = assetsToUnload.removeLast().normalizePath()
+      val asset = assets[assetPath]
+      if (asset != null && referenceCounts.getAndIncrement(assetPath, 0, -1) <= 1) {
+        assets.remove(assetPath)
+        referenceCounts.remove(assetPath, 0)
+        dependencies.remove(assetPath)?.forEach {
+          assetsToUnload.addLast(it)
+        }
+        (asset as? Disposable)?.dispose()
+      }
+    }
   }
-
-  /**
-   * Removes asset loaded with the given path. Does nothing if asset was not loaded in the first place. Does _not_
-   * dispose of the asset - it simply removes it from the [AssetStorage]. Use this method if you want to load the asset
-   * with the loader, but fully control the asset lifecycle.
-   * @param Asset type of the loaded asset.
-   * @param path used to [load] the asset.
-   * @return asset of the selected type if the asset was a fully loaded instance of [Asset].
-   */
-  inline fun <reified Asset> remove(path: String): Asset? = assets.remove(path.normalizePath()) as? Asset?
 
   /**
    * Disposes of all loaded [assets]. Rough equivalent of calling [unload] on each asset.
@@ -233,7 +357,20 @@ class AssetStorage(
         onError(path, error)
       }
     }
+    clear()
+  }
+
+  /**
+   * Clears assets collections _without_ unloading any assets. Used internally by [dispose]. Should be used only if you
+   * want to handle asynchronous loading with the [AssetStorage], but manage resources' lifecycle manually. In most
+   * other cases, [dispose] should be used instead.
+   * @see dispose
+   */
+  fun clear() {
     assets.clear()
+    dependencies.clear()
+    referenceCounts.clear()
+    scheduledAssets.clear()
   }
 
   /**
@@ -271,6 +408,19 @@ class AssetStorage(
   fun <Asset> setLoader(type: Class<Asset>, loader: Loader<Asset>, suffix: String?) {
     loaderStorage.setLoader(type, loader, suffix)
   }
+
+  /**
+   * @param path file path consistent with the [fileResolver] file type used to load the asset.
+   * @return amount of assets that depend on the selected assets. 0 if the asset is not loaded.
+   */
+  fun getReferencesCount(path: String): Int = referenceCounts[path, 0]
+
+  /**
+   * @param path file path consistent with the [fileResolver] file type used to load the asset.
+   * @return list of asset paths directly references by the selected asset. Empty if asset is not loaded or has no
+   *    dependencies.
+   */
+  fun getDependencies(path: String): List<String> = dependencies[path] ?: emptyList()
 
   override fun toString(): String
       = "AssetStorage[assets=$assets, loaders=$loaderStorage, executor=$executor, fileResolver=$fileResolver]"

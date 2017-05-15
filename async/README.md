@@ -127,8 +127,9 @@ Feature | `AssetStorage` | `AssetManager`
 *Synchronous loading* | **Limited.** A blocking coroutine can be launched to load assets eagerly, but it cannot block the rendering thread. | **Limited.** `finishLoading(String fileName)` method can be used to block the thread until the asset is loaded, but since it has no effect on loading order, all _other_ assets can be loaded before the requested one.
 *Error handling* | **Build-in language syntax.** Use a regular try-catch block within coroutine body to handle loading errors. Provides a clean way to separately handle exceptions thrown by different assets. | **Via listener.** One can register a global error handling listener that will be notified if a loading exception is thrown.
 *Loading order* | **Controlled by the user.** `AssetStorage` starts loading assets as soon as the `load` method is called, giving the user full control over the order of asset loading. | **Unpredictable.** If multiple assets are scheduled at once it is difficult to reason about loading order. `finishLoading` has no effect on loading order.
-*Thread safety* | **Good.** Forces `ktx-async` threading model based on coroutines. Executes blocking IO operations on a separate thread and - when necessary - finishes loading on main rendering thread. Trying to load the _same_ asset via multiple asynchronous coroutines can cause problems, though. | **Good.** Achieved through synchronizing most assets-related operations, which unfortunately blocks the threads. Thread blocking might affect application performance, especially since even the `get` method is synchronized.
+*Thread safety* | **Great.** Forces `ktx-async` threading model based on coroutines. Executes blocking IO operations on a separate thread and - when necessary - finishes loading on main rendering thread. Same asset - or assets with same dependencies - can be safely scheduled for loading on multiple coroutines at the same time. | **Good.** Achieved through synchronizing most assets-related operations, which unfortunately blocks the threads. Thread blocking might affect application performance, especially since even the `get` method is synchronized.
 *Progress tracking* | **Limited.** Since `AssetStorage` does not force the users to schedule loading of all assets up front, it does not know the exact percent of loaded assets. It provides only the name of currently loaded asset. Progress can be tracked externally. | **Supported.** Since all loaded assets have to be scheduled up front, `AssetManager` can track total loading progress.
+*Loading multiple assets concurrently* | **Supported.** Multiple asset loading coroutines can be launched at once. With `KtxAsync` concurrencyLevel _above 1_, multiple threads will handle asynchronous asset loading phases (IO) concurrently. | **Not supported.** `update()` loads assets one by one. `AsyncExecutor` with a single thread is used internally by the `AssetManager`.
 *Usage* | **Launch coroutine, load assets, use them as soon as loaded.** Asynchronous complexity is "hidden" by coroutines. | **Schedule loading, update in loop until loaded, extract from manager.** API based on polling (_are you done yet?_) rather than callbacks, which might prove tedious during loading phase.
 
 #### Utilities
@@ -388,6 +389,19 @@ ktxAsync {
     // try-catch blocks.
     exception.printStackTrace()
   }
+}
+```
+
+Asynchronous JSON files loading:
+```Kotlin
+import ktx.async.ktxAsync
+import com.badlogic.gdx.utils.Array as GdxArray
+
+ktxAsync {
+  val json = storage.loadJson<MyJsonType>("my.json")
+
+  // JSON arrays can be loaded to typed collections using a separate method:
+  val collection = storage.loadJsonCollection<GdxArray<ElementType>, ElementType>("array.json")
 }
 ```
 

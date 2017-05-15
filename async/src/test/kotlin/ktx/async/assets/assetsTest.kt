@@ -3,6 +3,7 @@ package ktx.async.assets
 import com.badlogic.gdx.Gdx
 import com.badlogic.gdx.assets.AssetDescriptor
 import com.badlogic.gdx.assets.AssetLoaderParameters
+import com.badlogic.gdx.assets.loaders.SynchronousAssetLoader
 import com.badlogic.gdx.assets.loaders.resolvers.ClasspathFileHandleResolver
 import com.badlogic.gdx.audio.Music
 import com.badlogic.gdx.audio.Sound
@@ -22,10 +23,7 @@ import com.badlogic.gdx.utils.Disposable
 import com.badlogic.gdx.utils.GdxRuntimeException
 import com.badlogic.gdx.utils.I18NBundle
 import com.badlogic.gdx.utils.async.AsyncExecutor
-import com.nhaarman.mockito_kotlin.doThrow
-import com.nhaarman.mockito_kotlin.mock
-import com.nhaarman.mockito_kotlin.never
-import com.nhaarman.mockito_kotlin.verify
+import com.nhaarman.mockito_kotlin.*
 import ktx.async.`coroutine test`
 import ktx.async.`destroy coroutines context`
 import ktx.async.assets.TextAssetLoader.TextAssetLoaderParameters
@@ -34,7 +32,12 @@ import org.junit.AfterClass
 import org.junit.Assert.*
 import org.junit.BeforeClass
 import org.junit.Test
+import java.util.Collections
+import java.util.IdentityHashMap
+import java.util.concurrent.ThreadLocalRandom
+import java.util.concurrent.atomic.AtomicInteger
 import com.badlogic.gdx.graphics.g3d.particles.ParticleEffect as ParticleEffect3d
+import com.badlogic.gdx.utils.Array as GdxArray
 
 /**
  * Tests [AssetStorage]: coroutines-based asset manager.
@@ -50,6 +53,8 @@ class AssetStorageTest {
       assertEquals("Content.", asset)
       assertTrue(storage.isLoaded("ktx/async/assets/string.txt"))
       assertSame(asset, storage.get<String>("ktx/async/assets/string.txt"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/string.txt"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/string.txt"))
     }
   }
 
@@ -63,6 +68,8 @@ class AssetStorageTest {
       assertEquals("Content.", asset)
       assertTrue(storage.isLoaded("ktx/async/assets/string.txt"))
       assertSame(asset, storage.get<String>("ktx/async/assets/string.txt"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/string.txt"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/string.txt"))
     }
   }
 
@@ -78,23 +85,44 @@ class AssetStorageTest {
       assertEquals("Content.", asset)
       assertTrue(storage.isLoaded("ktx/async/assets/string.txt"))
       assertSame(asset, storage.get<String>("ktx/async/assets/string.txt"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/string.txt"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/string.txt"))
     }
   }
 
   @Test
-  fun `should return loaded asset if trying to load the same asset`()
+  fun `should load text assets with descriptor as a dependency`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+    val descriptor = AssetDescriptor("ktx/async/assets/string.txt", String::class.java,
+        TextAssetLoaderParameters(charset = "UTF-8"))
+
+    ktxAsync {
+      val asset = storage.load(descriptor, isDependency = true)
+
+      assertEquals("Content.", asset)
+      assertTrue(storage.isLoaded("ktx/async/assets/string.txt"))
+      assertSame(asset, storage.get<String>("ktx/async/assets/string.txt"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/string.txt")) // Reference count not incremented.
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/string.txt"))
+    }
+  }
+
+  @Test
+  fun `should increase references count and return loaded asset if trying to load the same asset`()
       = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
     val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
 
     ktxAsync {
       val asset = storage.load<String>("ktx/async/assets/string.txt")
 
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/string.txt"))
       assertSame(asset, storage.load<String>("ktx/async/assets/string.txt"))
+      assertEquals(2, storage.getReferencesCount("ktx/async/assets/string.txt"))
     }
   }
 
   @Test
-  fun `should return loaded asset if trying to load the same asset with descriptor`()
+  fun `should increase references count return loaded asset if trying to load the same asset with descriptor`()
       = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
     val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
     val descriptor = AssetDescriptor("ktx/async/assets/string.txt", String::class.java,
@@ -103,7 +131,25 @@ class AssetStorageTest {
     ktxAsync {
       val asset = storage.load(descriptor)
 
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/string.txt"))
       assertSame(asset, storage.load(descriptor))
+      assertEquals(2, storage.getReferencesCount("ktx/async/assets/string.txt"))
+    }
+  }
+
+  @Test
+  fun `should not increase references count return loaded asset if trying to load the same asset with descriptor as dependency`()
+      = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+    val descriptor = AssetDescriptor("ktx/async/assets/string.txt", String::class.java,
+        TextAssetLoaderParameters(charset = "UTF-8"))
+
+    ktxAsync {
+      val asset = storage.load(descriptor)
+
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/string.txt"))
+      assertSame(asset, storage.load(descriptor, isDependency = true))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/string.txt"))
     }
   }
 
@@ -117,6 +163,9 @@ class AssetStorageTest {
       assertTrue(asset is BitmapFont)
       assertTrue(storage.isLoaded("com/badlogic/gdx/utils/arial-15.fnt"))
       assertSame(asset, storage.get<BitmapFont>("com/badlogic/gdx/utils/arial-15.fnt"))
+      assertEquals(1, storage.getReferencesCount("com/badlogic/gdx/utils/arial-15.fnt"))
+      assertEquals(listOf("com/badlogic/gdx/utils/arial-15.png"),
+          storage.getDependencies("com/badlogic/gdx/utils/arial-15.fnt"))
       // Font dependencies:
       assertTrue(storage.isLoaded("com/badlogic/gdx/utils/arial-15.png"))
       assertNotNull(storage.get<Texture>("com/badlogic/gdx/utils/arial-15.png"))
@@ -135,10 +184,30 @@ class AssetStorageTest {
       assertTrue(asset is BitmapFont)
       assertTrue(storage.isLoaded("com/badlogic/gdx/utils/arial-15.fnt"))
       assertSame(asset, storage.get<BitmapFont>("com/badlogic/gdx/utils/arial-15.fnt"))
+      assertEquals(1, storage.getReferencesCount("com/badlogic/gdx/utils/arial-15.fnt"))
+      assertEquals(listOf("com/badlogic/gdx/utils/arial-15.png"),
+          storage.getDependencies("com/badlogic/gdx/utils/arial-15.fnt"))
       // Font dependencies:
       assertTrue(storage.isLoaded("com/badlogic/gdx/utils/arial-15.png"))
       assertNotNull(storage.get<Texture>("com/badlogic/gdx/utils/arial-15.png"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload BitmapFont assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<BitmapFont>("com/badlogic/gdx/utils/arial-15.fnt")
+
+      storage.unload("com/badlogic/gdx/utils/arial-15.fnt")
+
+      assertFalse(storage.isLoaded("com/badlogic/gdx/utils/arial-15.fnt"))
+      assertEquals(0, storage.getReferencesCount("com/badlogic/gdx/utils/arial-15.fnt"))
+      assertEquals(emptyList<String>(), storage.getDependencies("com/badlogic/gdx/utils/arial-15.fnt"))
+      assertFalse(storage.isLoaded("com/badlogic/gdx/utils/arial-15.png"))
+      assertEquals(0, storage.getReferencesCount("com/badlogic/gdx/utils/arial-15.png"))
     }
   }
 
@@ -152,6 +221,8 @@ class AssetStorageTest {
       assertTrue(asset is Music)
       assertTrue(storage.isLoaded("ktx/async/assets/sound.ogg"))
       assertSame(asset, storage.get<Music>("ktx/async/assets/sound.ogg"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/sound.ogg"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/sound.ogg"))
       storage.dispose()
     }
   }
@@ -167,7 +238,24 @@ class AssetStorageTest {
       assertTrue(asset is Music)
       assertTrue(storage.isLoaded("ktx/async/assets/sound.ogg"))
       assertSame(asset, storage.get<Music>("ktx/async/assets/sound.ogg"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/sound.ogg"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/sound.ogg"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload Music assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Music>("ktx/async/assets/sound.ogg")
+
+      storage.unload("ktx/async/assets/sound.ogg")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/sound.ogg"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/sound.ogg"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/sound.ogg"))
     }
   }
 
@@ -181,6 +269,8 @@ class AssetStorageTest {
       assertTrue(asset is Sound)
       assertTrue(storage.isLoaded("ktx/async/assets/sound.ogg"))
       assertSame(asset, storage.get<Sound>("ktx/async/assets/sound.ogg"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/sound.ogg"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/sound.ogg"))
       storage.dispose()
     }
   }
@@ -196,7 +286,24 @@ class AssetStorageTest {
       assertTrue(asset is Sound)
       assertTrue(storage.isLoaded("ktx/async/assets/sound.ogg"))
       assertSame(asset, storage.get<Sound>("ktx/async/assets/sound.ogg"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/sound.ogg"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/sound.ogg"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload Sound assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Sound>("ktx/async/assets/sound.ogg")
+
+      storage.unload("ktx/async/assets/sound.ogg")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/sound.ogg"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/sound.ogg"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/sound.ogg"))
     }
   }
 
@@ -210,9 +317,12 @@ class AssetStorageTest {
       assertTrue(asset is TextureAtlas)
       assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
       assertSame(asset, storage.get<TextureAtlas>("ktx/async/assets/skin.atlas"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertEquals(listOf("ktx/async/assets/texture.png"), storage.getDependencies("ktx/async/assets/skin.atlas"))
       // Atlas dependencies:
       assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
       assertNotNull(storage.get<Texture>("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
       storage.dispose()
     }
   }
@@ -228,10 +338,30 @@ class AssetStorageTest {
       assertTrue(asset is TextureAtlas)
       assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
       assertSame(asset, storage.get<TextureAtlas>("ktx/async/assets/skin.atlas"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertEquals(listOf("ktx/async/assets/texture.png"), storage.getDependencies("ktx/async/assets/skin.atlas"))
       // Atlas dependencies:
       assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
       assertNotNull(storage.get<Texture>("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload TextureAtlas assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<TextureAtlas>("ktx/async/assets/skin.atlas")
+
+      storage.unload("ktx/async/assets/skin.atlas")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/skin.atlas"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/skin.atlas"))
+      assertFalse(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/texture.png"))
     }
   }
 
@@ -245,6 +375,8 @@ class AssetStorageTest {
       assertTrue(asset is Texture)
       assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
       assertSame(asset, storage.get<Texture>("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/texture.png"))
       storage.dispose()
     }
   }
@@ -260,7 +392,24 @@ class AssetStorageTest {
       assertTrue(asset is Texture)
       assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
       assertSame(asset, storage.get<Texture>("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/texture.png"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload Texture assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Texture>("ktx/async/assets/texture.png")
+
+      storage.unload("ktx/async/assets/texture.png")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/texture.png"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/texture.png"))
     }
   }
 
@@ -274,6 +423,8 @@ class AssetStorageTest {
       assertTrue(asset is Pixmap)
       assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
       assertSame(asset, storage.get<Pixmap>("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/texture.png"))
       storage.dispose()
     }
   }
@@ -289,7 +440,24 @@ class AssetStorageTest {
       assertTrue(asset is Pixmap)
       assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
       assertSame(asset, storage.get<Pixmap>("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/texture.png"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload Pixmap assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Pixmap>("ktx/async/assets/texture.png")
+
+      storage.unload("ktx/async/assets/texture.png")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/texture.png"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/texture.png"))
     }
   }
 
@@ -304,15 +472,20 @@ class AssetStorageTest {
       assertNotNull(asset.get("default", ButtonStyle::class.java))
       assertTrue(storage.isLoaded("ktx/async/assets/skin.json"))
       assertSame(asset, storage.get<Skin>("ktx/async/assets/skin.json"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/skin.json"))
+      assertEquals(listOf("ktx/async/assets/skin.atlas"), storage.getDependencies("ktx/async/assets/skin.json"))
 
       // Skin dependencies:
       assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
       val atlas = storage.get<TextureAtlas>("ktx/async/assets/skin.atlas")
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertEquals(listOf("ktx/async/assets/texture.png"), storage.getDependencies("ktx/async/assets/skin.atlas"))
       assertNotNull(atlas)
       assertNotNull(atlas?.findRegion("button"))
 
       assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
       assertNotNull(storage.get<Texture>("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
       storage.dispose()
     }
   }
@@ -329,16 +502,41 @@ class AssetStorageTest {
       assertNotNull(asset.get("default", ButtonStyle::class.java))
       assertTrue(storage.isLoaded("ktx/async/assets/skin.json"))
       assertSame(asset, storage.get<Skin>("ktx/async/assets/skin.json"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/skin.json"))
+      assertEquals(listOf("ktx/async/assets/skin.atlas"), storage.getDependencies("ktx/async/assets/skin.json"))
 
       // Skin dependencies:
       assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
       val atlas = storage.get<TextureAtlas>("ktx/async/assets/skin.atlas")
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertEquals(listOf("ktx/async/assets/texture.png"), storage.getDependencies("ktx/async/assets/skin.atlas"))
       assertNotNull(atlas)
       assertNotNull(atlas?.findRegion("button"))
 
       assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
       assertNotNull(storage.get<Texture>("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload Skin assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Skin>("ktx/async/assets/skin.json")
+
+      storage.unload("ktx/async/assets/skin.json")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/skin.json"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/skin.json"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/skin.json"))
+      assertFalse(storage.isLoaded("ktx/async/assets/skin.atlas"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/skin.atlas"))
+      assertFalse(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/texture.png"))
     }
   }
 
@@ -353,6 +551,8 @@ class AssetStorageTest {
       assertEquals("Value.", asset["key"])
       assertTrue(storage.isLoaded("ktx/async/assets/i18n"))
       assertSame(asset, storage.get<I18NBundle>("ktx/async/assets/i18n"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/i18n"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/i18n"))
       storage.dispose()
     }
   }
@@ -369,7 +569,24 @@ class AssetStorageTest {
       assertEquals("Value.", asset["key"])
       assertTrue(storage.isLoaded("ktx/async/assets/i18n"))
       assertSame(asset, storage.get<I18NBundle>("ktx/async/assets/i18n"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/i18n"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/i18n"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload I18NBundle assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<I18NBundle>("ktx/async/assets/i18n")
+
+      storage.unload("ktx/async/assets/i18n")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/i18n"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/i18n"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/i18n"))
     }
   }
 
@@ -383,6 +600,8 @@ class AssetStorageTest {
       assertTrue(asset is ParticleEffect)
       assertTrue(storage.isLoaded("ktx/async/assets/particle.p2d"))
       assertSame(asset, storage.get<ParticleEffect>("ktx/async/assets/particle.p2d"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/particle.p2d"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/particle.p2d"))
       storage.dispose()
     }
   }
@@ -398,7 +617,24 @@ class AssetStorageTest {
       assertTrue(asset is ParticleEffect)
       assertTrue(storage.isLoaded("ktx/async/assets/particle.p2d"))
       assertSame(asset, storage.get<ParticleEffect>("ktx/async/assets/particle.p2d"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/particle.p2d"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/particle.p2d"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload ParticleEffect assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<ParticleEffect>("ktx/async/assets/particle.p2d")
+
+      storage.unload("ktx/async/assets/particle.p2d")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/particle.p2d"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/particle.p2d"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/particle.p2d"))
     }
   }
 
@@ -412,9 +648,12 @@ class AssetStorageTest {
       assertTrue(asset is ParticleEffect3d)
       assertTrue(storage.isLoaded("ktx/async/assets/particle.p3d"))
       assertSame(asset, storage.get<ParticleEffect3d>("ktx/async/assets/particle.p3d"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/particle.p3d"))
+      assertEquals(listOf("ktx/async/assets/texture.png"), storage.getDependencies("ktx/async/assets/particle.p3d"))
       // Effect dependencies:
       assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
       assertNotNull(storage.get<Texture>("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
       storage.dispose()
     }
   }
@@ -430,10 +669,30 @@ class AssetStorageTest {
       assertTrue(asset is ParticleEffect3d)
       assertTrue(storage.isLoaded("ktx/async/assets/particle.p3d"))
       assertSame(asset, storage.get<ParticleEffect3d>("ktx/async/assets/particle.p3d"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/particle.p3d"))
+      assertEquals(listOf("ktx/async/assets/texture.png"), storage.getDependencies("ktx/async/assets/particle.p3d"))
       // Effect dependencies:
       assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
       assertNotNull(storage.get<Texture>("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload 3D ParticleEffect assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<ParticleEffect3d>("ktx/async/assets/particle.p3d")
+
+      storage.unload("ktx/async/assets/particle.p3d")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/particle.p3d"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/particle.p3d"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/particle.p3d"))
+      assertFalse(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/texture.png"))
     }
   }
 
@@ -447,6 +706,8 @@ class AssetStorageTest {
       assertTrue(asset is Model)
       assertTrue(storage.isLoaded("ktx/async/assets/model.obj"))
       assertSame(asset, storage.get<Model>("ktx/async/assets/model.obj"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/model.obj"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/model.obj"))
       storage.dispose()
     }
   }
@@ -462,7 +723,24 @@ class AssetStorageTest {
       assertTrue(asset is Model)
       assertTrue(storage.isLoaded("ktx/async/assets/model.obj"))
       assertSame(asset, storage.get<Model>("ktx/async/assets/model.obj"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/model.obj"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/model.obj"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload OBJ Model assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Model>("ktx/async/assets/model.obj")
+
+      storage.unload("ktx/async/assets/model.obj")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/model.obj"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/model.obj"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/model.obj"))
     }
   }
 
@@ -476,6 +754,8 @@ class AssetStorageTest {
       assertTrue(asset is Model)
       assertTrue(storage.isLoaded("ktx/async/assets/model.g3dj"))
       assertSame(asset, storage.get<Model>("ktx/async/assets/model.g3dj"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/model.g3dj"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/model.g3dj"))
       storage.dispose()
     }
   }
@@ -491,7 +771,24 @@ class AssetStorageTest {
       assertTrue(asset is Model)
       assertTrue(storage.isLoaded("ktx/async/assets/model.g3dj"))
       assertSame(asset, storage.get<Model>("ktx/async/assets/model.g3dj"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/model.g3dj"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/model.g3dj"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload G3DJ Model assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Model>("ktx/async/assets/model.g3dj")
+
+      storage.unload("ktx/async/assets/model.g3dj")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/model.g3dj"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/model.g3dj"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/model.g3dj"))
     }
   }
 
@@ -505,6 +802,8 @@ class AssetStorageTest {
       assertTrue(asset is Model)
       assertTrue(storage.isLoaded("ktx/async/assets/model.g3db"))
       assertSame(asset, storage.get<Model>("ktx/async/assets/model.g3db"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/model.g3db"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/model.g3db"))
       storage.dispose()
     }
   }
@@ -520,7 +819,24 @@ class AssetStorageTest {
       assertTrue(asset is Model)
       assertTrue(storage.isLoaded("ktx/async/assets/model.g3db"))
       assertSame(asset, storage.get<Model>("ktx/async/assets/model.g3db"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/model.g3db"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/model.g3db"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload G3DB Model assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Model>("ktx/async/assets/model.g3db")
+
+      storage.unload("ktx/async/assets/model.g3db")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/model.g3db"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/model.g3db"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/model.g3db"))
     }
   }
 
@@ -534,6 +850,8 @@ class AssetStorageTest {
       assertTrue(asset is ShaderProgram)
       assertTrue(storage.isLoaded("ktx/async/assets/shader.frag"))
       assertSame(asset, storage.get<ShaderProgram>("ktx/async/assets/shader.frag"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/shader.frag"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/shader.frag"))
       storage.dispose()
     }
   }
@@ -549,7 +867,310 @@ class AssetStorageTest {
       assertTrue(asset is ShaderProgram)
       assertTrue(storage.isLoaded("ktx/async/assets/shader.vert"))
       assertSame(asset, storage.get<ShaderProgram>("ktx/async/assets/shader.vert"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/shader.vert"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/shader.vert"))
       storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload ShaderProgram assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<ShaderProgram>("ktx/async/assets/shader.frag")
+
+      storage.unload("ktx/async/assets/shader.frag")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/shader.frag"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/shader.frag"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/shader.frag"))
+    }
+  }
+
+  @Test
+  fun `should load JSON assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      val asset = storage.loadJson<JsonExample>("ktx/async/assets/object.json")
+
+      assertTrue(asset is JsonExample)
+      assertEquals(10, asset.testInt)
+      assertEquals("Content.", asset.testString)
+      assertTrue(storage.isLoaded("ktx/async/assets/object.json"))
+      assertSame(asset, storage.get<JsonExample>("ktx/async/assets/object.json"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/object.json"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/object.json"))
+      storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload JSON assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.loadJson<JsonExample>("ktx/async/assets/object.json")
+
+      storage.unload("ktx/async/assets/object.json")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/object.json"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/object.json"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/object.json"))
+    }
+  }
+
+  @Test
+  fun `should return loaded JSON asset if trying to load the same asset`()
+      = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      val asset = storage.loadJson<JsonExample>("ktx/async/assets/object.json")
+
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/object.json"))
+      assertSame(asset, storage.loadJson<JsonExample>("ktx/async/assets/object.json"))
+      assertEquals(2, storage.getReferencesCount("ktx/async/assets/object.json"))
+    }
+  }
+
+  @Test
+  fun `should load JSON collection assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      val asset = storage.loadJsonCollection<GdxArray<JsonExample>, JsonExample>("ktx/async/assets/collection.json")
+
+      assertTrue(asset is GdxArray<*>)
+      assertEquals(2, asset.size)
+      assertTrue(storage.isLoaded("ktx/async/assets/collection.json"))
+      assertSame(asset, storage.get<GdxArray<JsonExample>>("ktx/async/assets/collection.json"))
+      asset[0].apply {
+        assertTrue(this is JsonExample)
+        assertEquals(10, testInt)
+        assertEquals("Content.", testString)
+      }
+      asset[1].apply {
+        assertTrue(this is JsonExample)
+        assertEquals(20, testInt)
+        assertEquals("Test.", testString)
+      }
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/collection.json"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/collection.json"))
+      storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should unload JSON collection assets`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.loadJsonCollection<GdxArray<JsonExample>, JsonExample>("ktx/async/assets/collection.json")
+
+      storage.unload("ktx/async/assets/collection.json")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/collection.json"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/collection.json"))
+      assertEquals(emptyList<String>(), storage.getDependencies("ktx/async/assets/collection.json"))
+    }
+  }
+
+  @Test
+  fun `should return loaded JSON collection asset if trying to load the same asset`()
+      = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      val asset = storage.loadJsonCollection<GdxArray<JsonExample>, JsonExample>("ktx/async/assets/collection.json")
+
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/collection.json"))
+      assertSame(asset, storage.loadJsonCollection<GdxArray<JsonExample>, JsonExample>("ktx/async/assets/collection.json"))
+      assertEquals(2, storage.getReferencesCount("ktx/async/assets/collection.json"))
+      assertSame(asset, storage.loadJson<GdxArray<JsonExample>>("ktx/async/assets/collection.json"))
+      assertEquals(3, storage.getReferencesCount("ktx/async/assets/collection.json"))
+    }
+  }
+
+  @Test
+  fun `should increase dependency reference counts recursively`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Skin>("ktx/async/assets/skin.json")
+      storage.load<Skin>("ktx/async/assets/skin.json")
+      storage.load<Skin>("ktx/async/assets/skin.json")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.json"))
+      assertEquals(3, storage.getReferencesCount("ktx/async/assets/skin.json"))
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
+
+      storage.load<TextureAtlas>("ktx/async/assets/skin.atlas")
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
+      assertEquals(2, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
+
+      storage.dispose()
+    }
+  }
+
+  @Test
+  fun `should recursively unload dependencies of assets scheduled multiple times`()
+      = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Skin>("ktx/async/assets/skin.json")
+      storage.load<Skin>("ktx/async/assets/skin.json")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.json"))
+      assertEquals(2, storage.getReferencesCount("ktx/async/assets/skin.json"))
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
+
+      storage.unload("ktx/async/assets/skin.json")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.json"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/skin.json"))
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
+
+      storage.unload("ktx/async/assets/skin.json")
+
+      assertFalse(storage.isLoaded("ktx/async/assets/skin.json"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/skin.json"))
+      assertFalse(storage.isLoaded("ktx/async/assets/skin.atlas"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/skin.atlas"))
+      assertFalse(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(0, storage.getReferencesCount("ktx/async/assets/texture.png"))
+    }
+  }
+
+  @Test
+  fun `should not throw exception when trying to load the same asset on multiple coroutines at the same time`()
+      = `coroutine test`(concurrencyLevel = 4, timeLimitMillis = 60000L) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+    val expectedTextureReferences = AtomicInteger(0)
+
+    repeat(50) {
+      ktxAsync {
+        repeat(ThreadLocalRandom.current().nextInt(0, 10)) { skipFrame() }
+        expectedTextureReferences.incrementAndGet()
+        val asset = storage.load<Texture>("ktx/async/assets/texture.png")
+
+        assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+        assertEquals(expectedTextureReferences.get(), storage.getReferencesCount("ktx/async/assets/texture.png"))
+        assertSame(asset, storage.get<Texture>("ktx/async/assets/texture.png"))
+        skipFrame()
+        assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+        assertEquals(expectedTextureReferences.get(), storage.getReferencesCount("ktx/async/assets/texture.png"))
+        expectedTextureReferences.decrementAndGet()
+        storage.unload("ktx/async/assets/texture.png")
+      }
+    }
+  }
+
+  @Test
+  fun `should not throw exception when trying to load assets with same dependencies on multiple coroutines at the same time`()
+      = `coroutine test`(concurrencyLevel = 2, timeLimitMillis = 20000L) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<Skin>("ktx/async/assets/skin.json")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.json"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      skipFrame()
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.json"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      storage.unload("ktx/async/assets/skin.json")
+    }
+
+    ktxAsync {
+      storage.load<TextureAtlas>("ktx/async/assets/skin.atlas")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      storage.unload("ktx/async/assets/skin.atlas")
+    }
+
+    ktxAsync {
+      storage.load<Skin>("ktx/async/assets/skin.json")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.json"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      storage.unload("ktx/async/assets/skin.json")
+    }
+
+    ktxAsync {
+      storage.load<TextureAtlas>("ktx/async/assets/skin.atlas")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      skipFrame()
+      assertTrue(storage.isLoaded("ktx/async/assets/skin.atlas"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      storage.unload("ktx/async/assets/skin.atlas")
+    }
+
+    ktxAsync {
+      storage.load<ParticleEffect3d>("ktx/async/assets/particle.p3d")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/particle.p3d"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      skipFrame()
+      assertTrue(storage.isLoaded("ktx/async/assets/particle.p3d"))
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      storage.unload("ktx/async/assets/particle.p3d")
+    }
+
+    ktxAsync {
+      storage.load<Texture>("ktx/async/assets/texture.png")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      skipFrame()
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      storage.unload("ktx/async/assets/texture.png")
+    }
+
+    ktxAsync {
+      storage.load<Texture>("ktx/async/assets/texture.png")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      storage.unload("ktx/async/assets/texture.png")
+    }
+  }
+
+  @Test
+  fun `should suspend other coroutines until asset is loaded`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+    val assets = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
+    val loader = mock<SynchronousAssetLoader<Any, AssetLoaderParameters<Any>>> {
+      on(it.load(any(), any(), any(), anyOrNull())) doAnswer {
+        Thread.sleep(200L)
+        Any()
+      }
+    }
+    storage.setLoader(loader)
+
+    repeat(5) {
+      ktxAsync {
+        val asset = storage.load<Any>("mock")
+
+        assertTrue(storage.isLoaded("mock"))
+        assets.add(asset)
+        assertEquals(1, assets.size)
+        verify(loader, times(1)).load(any(), any(), any(), anyOrNull())
+      }
     }
   }
 
@@ -699,15 +1320,24 @@ class AssetStorageTest {
   }
 
   @Test
-  fun `should unload asset`() {
-    val storage = assetStorage()
+  fun `should unload asset`() = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
     val asset = mock<Disposable>()
-    storage.assets.put("test", asset)
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+    storage.setLoader(mock<SynchronousAssetLoader<Disposable, AssetLoaderParameters<Disposable>>> {
+      on(it.load(any(), any(), any(), anyOrNull())) doReturn asset
+    })
 
-    storage.unload("test")
+    ktxAsync {
+      storage.load<Disposable>("mock")
+      assertTrue(storage.isLoaded("mock"))
 
-    assertFalse(storage.assets.containsKey("test"))
-    verify(asset).dispose()
+      storage.unload("mock")
+
+      assertFalse(storage.isLoaded("mock"))
+      assertFalse(storage.assets.containsKey("mock"))
+      verify(asset).dispose()
+      assertEquals(0, storage.getReferencesCount("mock"))
+    }
   }
 
   @Test
@@ -718,38 +1348,37 @@ class AssetStorageTest {
   }
 
   @Test
-  fun `should remove asset without disposing`() {
-    val storage = assetStorage()
-    val asset = mock<Disposable>()
-    storage.assets.put("test", asset)
+  fun `should not unload dependency of an unloaded asset if the dependency is referenced by another loaded asset`()
+      = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
 
-    val removed = storage.remove<Disposable>("test")
+    ktxAsync {
+      storage.load<TextureAtlas>("ktx/async/assets/skin.atlas")
+      storage.load<ParticleEffect3d>("ktx/async/assets/particle.p3d")
 
-    assertSame(asset, removed)
-    assertFalse(storage.assets.containsKey("test"))
-    verify(asset, never()).dispose()
+      storage.unload("ktx/async/assets/skin.atlas")
+
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
+      assertFalse(storage.isLoaded("ktx/async/assets/skin.atlas"))
+    }
   }
 
   @Test
-  fun `should remove asset without disposing, but do not return it if its type is inconsistent with the request`() {
-    val storage = assetStorage()
-    val asset = mock<Disposable>()
-    storage.assets.put("test", asset)
+  fun `should not unload dependency of an unloaded asset if the dependency was explicitly scheduled for loading`()
+      = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
 
-    val removed = storage.remove<String>("test") // Requesting a String, actual asset is Disposable.
+    ktxAsync {
+      storage.load<TextureAtlas>("ktx/async/assets/skin.atlas")
+      storage.load<Texture>("ktx/async/assets/texture.png")
 
-    assertNull(removed)
-    assertFalse(storage.assets.containsKey("test"))
-    verify(asset, never()).dispose()
-  }
+      storage.unload("ktx/async/assets/skin.atlas")
 
-  @Test
-  fun `should return null if trying to remove absent asset`() {
-    val storage = assetStorage()
-
-    val removed = storage.remove<String>("test")
-
-    assertNull(removed)
+      assertTrue(storage.isLoaded("ktx/async/assets/texture.png"))
+      assertEquals(1, storage.getReferencesCount("ktx/async/assets/texture.png"))
+      assertFalse(storage.isLoaded("ktx/async/assets/skin.atlas"))
+    }
   }
 
   @Test
@@ -805,6 +1434,56 @@ class AssetStorageTest {
   }
 
   @Test
+  fun `should dispose of multiple assets of different types without errors`()
+      = `coroutine test`(concurrencyLevel = 1) { ktxAsync ->
+    val storage = AssetStorage(fileResolver = ClasspathFileHandleResolver())
+
+    ktxAsync {
+      storage.load<String>("ktx/async/assets/string.txt")
+      storage.load<BitmapFont>("com/badlogic/gdx/utils/arial-15.fnt")
+      storage.load<Music>("ktx/async/assets/sound.ogg")
+      storage.load<TextureAtlas>("ktx/async/assets/skin.atlas")
+      storage.load<Texture>("ktx/async/assets/texture.png")
+      storage.load<Skin>("ktx/async/assets/skin.json")
+      storage.load<I18NBundle>("ktx/async/assets/i18n")
+      storage.load<ParticleEffect>("ktx/async/assets/particle.p2d")
+      storage.load<ParticleEffect3d>("ktx/async/assets/particle.p3d")
+      storage.load<Model>("ktx/async/assets/model.obj")
+      storage.load<Model>("ktx/async/assets/model.g3dj")
+      storage.load<Model>("ktx/async/assets/model.g3db")
+      storage.load<ShaderProgram>("ktx/async/assets/shader.frag")
+      storage.loadJson<JsonExample>("ktx/async/assets/object.json")
+      storage.loadJsonCollection<GdxArray<JsonExample>, JsonExample>("ktx/async/assets/collection.json")
+
+      storage.dispose()
+
+      assertEquals(0, storage.assets.size)
+      arrayOf(
+          "ktx/async/assets/string.txt",
+          "com/badlogic/gdx/utils/arial-15.fnt",
+          "com/badlogic/gdx/utils/arial-15.png",
+          "ktx/async/assets/sound.ogg",
+          "ktx/async/assets/skin.atlas",
+          "ktx/async/assets/texture.png",
+          "ktx/async/assets/skin.json",
+          "ktx/async/assets/i18n",
+          "ktx/async/assets/particle.p2d",
+          "ktx/async/assets/particle.p3d",
+          "ktx/async/assets/model.obj",
+          "ktx/async/assets/model.g3dj",
+          "ktx/async/assets/model.g3db",
+          "ktx/async/assets/shader.frag",
+          "ktx/async/assets/shader.vert",
+          "ktx/async/assets/object.json",
+          "ktx/async/assets/collection.json").forEach {
+        assertFalse(storage.isLoaded(it))
+        assertEquals(0, storage.getReferencesCount(it))
+        assertEquals(emptyList<String>(), storage.getDependencies(it))
+      }
+    }
+  }
+
+  @Test
   fun `should dispose of all assets with optional error handling`() {
     val storage = assetStorage()
     val disposables = (1..5).map { it.toString() to mock<Disposable>() }
@@ -842,6 +1521,21 @@ class AssetStorageTest {
     verify(validAsset).dispose()
   }
 
+  @Test
+  fun `should clear all assets without disposing`() {
+    val storage = assetStorage()
+    val disposables = (1..5).map { it.toString() to mock<Disposable>() }
+        .onEach { (path, asset) -> storage.assets.put(path, asset) }
+        .map { (_, asset) -> asset }.toList()
+
+    storage.clear()
+
+    assertEquals(0, storage.assets.size)
+    disposables.forEach {
+      verify(it, never()).dispose()
+    }
+  }
+
   private fun assetStorage() = AssetStorage(
       fileResolver = ClasspathFileHandleResolver(),
       executor = AsyncExecutor(1),
@@ -850,6 +1544,12 @@ class AssetStorageTest {
   @After
   fun dispose() {
     `destroy coroutines context`()
+  }
+
+  /** Used for JSON loading tests. */
+  class JsonExample {
+    var testInt = 0
+    var testString = ""
   }
 
   companion object {
